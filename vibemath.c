@@ -2,7 +2,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <math.h>
-#include <stdatomic.h>
 
 #ifdef _WIN32
     #define EXPORT __declspec(dllexport)
@@ -13,23 +12,15 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
-
 // ========================================================
-// THE ATOMIC SPIN-LOCK THREAD POOL
-// ========================================================
-// Signals: 0 = Sleep, 1 = Work, 2 = Quit
-atomic_int g_phys_sig = 0; atomic_int g_phys_done = 1;
-atomic_int g_top_sig  = 0; atomic_int g_top_done  = 1;
-atomic_int g_bot_sig  = 0; atomic_int g_bot_done  = 1;
-
-
-// ========================================================
-// CROSS-PLATFORM THREADING BRIDGE
+// CROSS-PLATFORM THREADING BRIDGE (Mutex & CondVars)
 // ========================================================
 #if defined(_WIN32) || defined(_WIN64)
-    // --- WINDOWS THREADING ---
     #include <windows.h>
     typedef HANDLE vmath_thread_t;
+    typedef CRITICAL_SECTION vmath_mutex_t;
+    typedef CONDITION_VARIABLE vmath_cond_t;
+
     #define THREAD_FUNC DWORD WINAPI
     #define THREAD_RETURN_VAL 0
 
@@ -41,10 +32,22 @@ atomic_int g_bot_sig  = 0; atomic_int g_bot_done  = 1;
         CloseHandle(thread);
     }
 
+    static void vmath_mutex_init(vmath_mutex_t* m) { InitializeCriticalSection(m); }
+    static void vmath_mutex_lock(vmath_mutex_t* m) { EnterCriticalSection(m); }
+    static void vmath_mutex_unlock(vmath_mutex_t* m) { LeaveCriticalSection(m); }
+    static void vmath_mutex_destroy(vmath_mutex_t* m) { DeleteCriticalSection(m); }
+
+    static void vmath_cond_init(vmath_cond_t* cv) { InitializeConditionVariable(cv); }
+    static void vmath_cond_wait(vmath_cond_t* cv, vmath_mutex_t* m) { SleepConditionVariableCS(cv, m, INFINITE); }
+    static void vmath_cond_broadcast(vmath_cond_t* cv) { WakeAllConditionVariable(cv); }
+    static void vmath_cond_destroy(vmath_cond_t* cv) { /* No-op on Windows */ }
+
 #else
-    // --- POSIX THREADING (Linux / macOS) ---
     #include <pthread.h>
     typedef pthread_t vmath_thread_t;
+    typedef pthread_mutex_t vmath_mutex_t;
+    typedef pthread_cond_t vmath_cond_t;
+
     #define THREAD_FUNC void*
     #define THREAD_RETURN_VAL NULL
 
@@ -56,8 +59,42 @@ atomic_int g_bot_sig  = 0; atomic_int g_bot_done  = 1;
     static void vmath_thread_join(vmath_thread_t thread) {
         pthread_join(thread, NULL);
     }
+
+    static void vmath_mutex_init(vmath_mutex_t* m) { pthread_mutex_init(m, NULL); }
+    static void vmath_mutex_lock(vmath_mutex_t* m) { pthread_mutex_lock(m); }
+    static void vmath_mutex_unlock(vmath_mutex_t* m) { pthread_mutex_unlock(m); }
+    static void vmath_mutex_destroy(vmath_mutex_t* m) { pthread_mutex_destroy(m); }
+
+    static void vmath_cond_init(vmath_cond_t* cv) { pthread_cond_init(cv, NULL); }
+    static void vmath_cond_wait(vmath_cond_t* cv, vmath_mutex_t* m) { pthread_cond_wait(cv, m); }
+    static void vmath_cond_broadcast(vmath_cond_t* cv) { pthread_cond_broadcast(cv); }
+    static void vmath_cond_destroy(vmath_cond_t* cv) { pthread_cond_destroy(cv); }
 #endif
 
+
+// ========================================================
+// THE OS-SLEEP THREAD POOL STATE
+// ========================================================
+// Physics Thread State
+vmath_mutex_t g_phys_mutex;
+vmath_cond_t  g_phys_cv_start;
+vmath_cond_t  g_phys_cv_done;
+int g_phys_sig  = 0; 
+int g_phys_done = 1;
+
+// Top Raster Thread State
+vmath_mutex_t g_top_mutex;
+vmath_cond_t  g_top_cv_start;
+vmath_cond_t  g_top_cv_done;
+int g_top_sig  = 0;
+int g_top_done = 1;
+
+// Bottom Raster Thread State
+vmath_mutex_t g_bot_mutex;
+vmath_cond_t  g_bot_cv_start;
+vmath_cond_t  g_bot_cv_done;
+int g_bot_sig  = 0;
+int g_bot_done = 1;
 // ========================================================================
 // FAST AVX2 TRIGONOMETRY (Minimax Approximations)
 // ========================================================================
@@ -179,8 +216,8 @@ typedef struct {
 PhysicsThreadPayload g_physics_payload;
 vmath_thread_t g_physics_thread;
 
-// --- [NEW] DISPLAY LIST BUCKETS ---
-#define MAX_DISP_TRIS 500000 // 2 Megabytes of RAM per list, perfectly safe
+// --- [FIXED] 1 MILLION DISPLAY LIST BUCKETS ---
+#define MAX_DISP_TRIS 1000000 // Safely stores 200k Quads (800k Triangles) + 200k overhead
 int g_TopList[MAX_DISP_TRIS];
 int g_BotList[MAX_DISP_TRIS];
 
@@ -515,7 +552,7 @@ EXPORT void vmath_process_triangles(
 }
 EXPORT void vmath_rasterize_list(
     int* display_list, int list_count,
-    int* v1, int* v2, int* v3, 
+    int* v1, int* v2, int* v3,
     float* px, float* py, float* pz,
     uint32_t* shaded_color,
     uint32_t* screen_buffer, float* z_buffer,
@@ -524,7 +561,7 @@ EXPORT void vmath_rasterize_list(
 ) {
     for (int k = 0; k < list_count; k++) {
         // [SMART CACHE]: Fetch the exact Triangle ID from the bin!
-        int i = display_list[k]; 
+        int i = display_list[k];
 
         int i1 = v1[i], i2 = v2[i], i3 = v3[i];
         float x1 = px[i1], y1 = py[i1], z1 = pz[i1];
@@ -543,8 +580,8 @@ EXPORT void vmath_rasterize_list(
         int y_start = (int)fmaxf((float)min_clip_y, ceilf(y1));
         int y_end   = (int)fminf((float)max_clip_y, floorf(y3));
 
-        if (y_start > y_end) continue; 
-        
+        if (y_start > y_end) continue;
+
         float inv_total = 1.0f / total_height;
 
         // ==========================================
@@ -554,10 +591,10 @@ EXPORT void vmath_rasterize_list(
         if (dy_upper > 0.0f) {
             float inv_upper = 1.0f / dy_upper;
             // Ensure we don't draw past the thread's max_clip_y, even if the triangle continues
-            int limit_y = (int)fminf((float)y_end, floorf(y2)); 
+            int limit_y = (int)fminf((float)y_end, floorf(y2));
 
             for (int y = y_start; y <= limit_y; y++) {
-                // ... [Keep your exact horizontal AVX2 row rendering loop here!] ...
+
                 float t_total = (y - y1) * inv_total;
                 float t_half  = (y - y1) * inv_upper;
                 float ax = x1 + (x3 - x1) * t_total, az = z1 + (z3 - z1) * t_total;
@@ -617,7 +654,7 @@ EXPORT void vmath_rasterize_list(
             int start_y = (int)fmaxf((float)y_start, ceilf(y2));
 
             for (int y = start_y; y <= y_end; y++) {
-                // ... [Keep your exact horizontal AVX2 row rendering loop here!] ...
+
                 float t_total = (y - y1) * inv_total;
                 float t_half  = (y - y2) * inv_lower;
                 float ax = x1 + (x3 - x1) * t_total, az = z1 + (z3 - z1) * t_total;
@@ -1561,25 +1598,35 @@ EXPORT void vmath_swarm_smales(
         vz[i] = v_z;
     }
 }
-// ========================================================================
-// RENDER BATCH HELPERS
-// ========================================================================
 // ========================================================
-// CORE 3 & CORE 4: RASTER WORKERS
+// CORE 3 & CORE 4: OS-SLEEPING RASTER WORKERS
 // ========================================================
 THREAD_FUNC vmath_raster_worker(void* arg) {
     int is_bot = (int)(intptr_t)arg;
     RasterThreadPayload* p = is_bot ? &g_raster_bot_payload : &g_raster_top_payload;
-    atomic_int* my_sig  = is_bot ? &g_bot_sig  : &g_top_sig;
-    atomic_int* my_done = is_bot ? &g_bot_done : &g_top_done;
+    
+    vmath_mutex_t* my_mutex    = is_bot ? &g_bot_mutex    : &g_top_mutex;
+    vmath_cond_t* my_cv_start = is_bot ? &g_bot_cv_start : &g_top_cv_start;
+    vmath_cond_t* my_cv_done  = is_bot ? &g_bot_cv_done  : &g_top_cv_done;
+    int* my_sig      = is_bot ? &g_bot_sig      : &g_top_sig;
+    int* my_done     = is_bot ? &g_bot_done     : &g_top_done;
 
     while (1) {
-        // SPIN-WAIT FOR SIGNAL
-        while (atomic_load(my_sig) == 0) { _mm_pause(); }
-        if (atomic_load(my_sig) == 2) break; // Quit signal
+        // 1. LOCK & SLEEP: Give CPU back to OS until signaled
+        vmath_mutex_lock(my_mutex);
+        while (*my_sig == 0) { 
+            vmath_cond_wait(my_cv_start, my_mutex); 
+        }
+        
+        // 2. CHECK FOR QUIT SIGNAL
+        if (*my_sig == 2) {
+            vmath_mutex_unlock(my_mutex);
+            break; 
+        }
+        vmath_mutex_unlock(my_mutex); // Unlock so main thread doesn't hang
 
+        // 3. DO THE HEAVY LIFTING
         RenderMemory* mem = p->mem;
-
         vmath_rasterize_list(
             p->display_list, p->list_count,
             mem->Tri_V1, mem->Tri_V2, mem->Tri_V3,
@@ -1589,18 +1636,24 @@ THREAD_FUNC vmath_raster_worker(void* arg) {
             p->min_clip_y, p->max_clip_y
         );
 
-        // WORK FINISHED: Reset signal and flag done!
-        atomic_store(my_sig, 0);
-        atomic_store(my_done, 1);
+        // 4. WORK FINISHED: Lock, update flags, and wake up main thread
+        vmath_mutex_lock(my_mutex);
+        *my_sig = 0;
+        *my_done = 1;
+        vmath_cond_broadcast(my_cv_done);
+        vmath_mutex_unlock(my_mutex);
     }
     return THREAD_RETURN_VAL;
 }
-
+// ========================================================
+// PHASE 2: ATOMIC DISPATCH REWRITE
+// ========================================================
 EXPORT void vmath_render_batch(
     int start_id, int end_id,
     CameraState* cam, float HALF_W, float HALF_H, float sun_x, float sun_y, float sun_z,
     RenderMemory* mem, uint32_t* ScreenPtr, float* ZBuffer, int CANVAS_W, int CANVAS_H
 ) {
+    // ... [Keep the Phase 1 Projection and Phase 1.5 Binning EXACTLY the same] ...
     float cpx = cam->x, cpy = cam->y, cpz = cam->z;
     float cfw_x = cam->fwx, cfw_y = cam->fwy, cfw_z = cam->fwz;
     float crt_x = cam->rtx, crt_z = cam->rtz;
@@ -1672,8 +1725,9 @@ EXPORT void vmath_render_batch(
             }
         }
     }
-    // --- PHASE 2: ATOMIC DISPATCH ---
-    // Setup Payloads (Same as before)
+    // --- PHASE 2: MUTEX WAKE-UP DISPATCH ---
+    g_raster_top_payload.display_list = g_TopList; g_raster_top_payload.list_count = top_count; // (Assuming top_count populated above)
+    // ... setup payloads ...
     g_raster_top_payload.display_list = g_TopList; g_raster_top_payload.list_count = top_count;
     g_raster_top_payload.mem = mem; g_raster_top_payload.ScreenPtr = ScreenPtr; g_raster_top_payload.ZBuffer = ZBuffer;
     g_raster_top_payload.CANVAS_W = CANVAS_W; g_raster_top_payload.CANVAS_H = CANVAS_H;
@@ -1683,19 +1737,28 @@ EXPORT void vmath_render_batch(
     g_raster_bot_payload.mem = mem; g_raster_bot_payload.ScreenPtr = ScreenPtr; g_raster_bot_payload.ZBuffer = ZBuffer;
     g_raster_bot_payload.CANVAS_W = CANVAS_W; g_raster_bot_payload.CANVAS_H = CANVAS_H;
     g_raster_bot_payload.min_clip_y = mid_y; g_raster_bot_payload.max_clip_y = CANVAS_H - 1;
+    // WAKE UP TOP THREAD
+    vmath_mutex_lock(&g_top_mutex);
+    g_top_done = 0;
+    g_top_sig = 1;
+    vmath_cond_broadcast(&g_top_cv_start);
+    vmath_mutex_unlock(&g_top_mutex);
 
-    // 1. Reset 'Done' flags
-    atomic_store(&g_top_done, 0);
-    atomic_store(&g_bot_done, 0);
+    // WAKE UP BOTTOM THREAD
+    vmath_mutex_lock(&g_bot_mutex);
+    g_bot_done = 0;
+    g_bot_sig = 1;
+    vmath_cond_broadcast(&g_bot_cv_start);
+    vmath_mutex_unlock(&g_bot_mutex);
 
-    // 2. SIGNAL WORKERS TO WAKE UP INSTANTLY!
-    atomic_store(&g_top_sig, 1);
-    atomic_store(&g_bot_sig, 1);
+    // SYNCHRONIZATION: Sleep main thread until both reply they are done
+    vmath_mutex_lock(&g_top_mutex);
+    while (g_top_done == 0) { vmath_cond_wait(&g_top_cv_done, &g_top_mutex); }
+    vmath_mutex_unlock(&g_top_mutex);
 
-    // 3. Main thread spin-waits for them to finish
-    while (atomic_load(&g_top_done) == 0 || atomic_load(&g_bot_done) == 0) {
-        _mm_pause();
-    }
+    vmath_mutex_lock(&g_bot_mutex);
+    while (g_bot_done == 0) { vmath_cond_wait(&g_bot_cv_done, &g_bot_mutex); }
+    vmath_mutex_unlock(&g_bot_mutex);
 }
 
 // A dead-simple scalar sphere. No noise, no SIMD, purely a stable target for our Transition Weaving tests.
@@ -1785,16 +1848,24 @@ EXPORT void vmath_swarm_sort_depth(
     // Because we do exactly 4 passes, the pointers swap perfectly back to their original arrays!
 }
 // ========================================================
-// CORE 2: PHYSICS WORKER
+// CORE 2: PHYSICS WORKER (Mutex Upgrade)
 // ========================================================
 THREAD_FUNC vmath_physics_worker(void* arg) {
     PhysicsThreadPayload* p = &g_physics_payload;
 
     while (1) {
-        // SPIN-WAIT FOR SIGNAL
-        while (atomic_load(&g_phys_sig) == 0) { _mm_pause(); }
-        if (atomic_load(&g_phys_sig) == 2) break; // Quit signal
+        // SLEEP UNTIL NEEDED
+        vmath_mutex_lock(&g_phys_mutex);
+        while (g_phys_sig == 0) { 
+            vmath_cond_wait(&g_phys_cv_start, &g_phys_mutex); 
+        }
+        if (g_phys_sig == 2) { 
+            vmath_mutex_unlock(&g_phys_mutex);
+            break; 
+        }
+        vmath_mutex_unlock(&g_phys_mutex);
 
+        // DO PHYSICS WORK
         RenderMemory* mem = p->mem;
         float time = p->time;
         float dt = p->dt;
@@ -1802,7 +1873,8 @@ THREAD_FUNC vmath_physics_worker(void* arg) {
         int w = p->write_idx;
 
         for (int i = 0; i < p->command_count; i++) {
-            // ... [KEEP YOUR EXACT PHYSICS SWITCH STATEMENT HERE] ...
+            // ... [KEEP YOUR SWITCH STATEMENT EXACTLY THE SAME] ...
+            // e.g. int swarm_count = mem->Obj_VertCount[0] / 4;
             int opcode = p->queue[i];
 
             int swarm_count = mem->Obj_VertCount[0] / 4; // Replacing hardcoded object count with hardcoded vertex count (4)
@@ -1851,15 +1923,18 @@ THREAD_FUNC vmath_physics_worker(void* arg) {
                     break;
             }
         }
-        // WORK FINISHED: Reset signal and flag done!
-        atomic_store(&g_phys_sig, 0);
-        atomic_store(&g_phys_done, 1);
+
+        // SIGNAL MAIN THREAD WE ARE DONE
+        vmath_mutex_lock(&g_phys_mutex);
+        g_phys_sig = 0;
+        g_phys_done = 1;
+        vmath_cond_broadcast(&g_phys_cv_done);
+        vmath_mutex_unlock(&g_phys_mutex);
     }
     return THREAD_RETURN_VAL;
 }
-
 // ========================================================
-// CORE 1: MAIN DISPATCHER & RENDERER
+// MAIN DISPATCHER UPDATE
 // ========================================================
 EXPORT void vmath_execute_queue(
     int* queue, int command_count,
@@ -1869,7 +1944,6 @@ EXPORT void vmath_execute_queue(
     float time, float dt,
     int read_idx, int write_idx
 ) {
-    // 1. PACK THE PAYLOAD AND LAUNCH CORE 2 (Physics)
     g_physics_payload.command_count = command_count;
     g_physics_payload.queue = queue;
     g_physics_payload.mem = mem;
@@ -1877,13 +1951,16 @@ EXPORT void vmath_execute_queue(
     g_physics_payload.dt = dt;
     g_physics_payload.read_idx = read_idx;
     g_physics_payload.write_idx = write_idx;
-    // i commented this out i think its correct, gemini?
-    // g_physics_thread = vmath_thread_start(vmath_physics_worker, &g_physics_payload);
 
-    atomic_store(&g_phys_done, 0);
-    atomic_store(&g_phys_sig, 1); // WAKE UP PHYSICS!
+    // WAKE UP PHYSICS THREAD
+    vmath_mutex_lock(&g_phys_mutex);
+    g_phys_done = 0;
+    g_phys_sig = 1;
+    vmath_cond_broadcast(&g_phys_cv_start);
+    vmath_mutex_unlock(&g_phys_mutex);
 
-    // 2. CORE 1 EXECUTES RENDER COMMANDS SIMULTANEOUSLY
+    // ... [DO MAIN THREAD WORK (Command processing)] ...
+    // CORE 1 EXECUTES RENDER COMMANDS SIMULTANEOUSLY
     float HALF_W = CANVAS_W * 0.5f;
     float HALF_H = CANVAS_H * 0.5f;
     float sun_x = 0.577f, sun_y = -0.577f, sun_z = 0.577f;
@@ -1905,35 +1982,48 @@ EXPORT void vmath_execute_queue(
                 vmath_generate_basic_sphere(mem->Vert_LX + mem->Obj_VertStart[1], mem->Vert_LY + mem->Obj_VertStart[1], mem->Vert_LZ + mem->Obj_VertStart[1], 100, 100, 3500.0f);
                 break;
 
-            case 11: { // RENDER_CULL
+            case 11: { // RENDER
                 int id = queue[++i];
                 vmath_render_batch(id, id, cam, HALF_W, HALF_H, sun_x, sun_y, sun_z, mem, ScreenPtr, ZBuffer, CANVAS_W, CANVAS_H);
                 break;
             }
         }
     }
-
-    // 3. SYNCHRONIZATION POINT (Wait for Physics to finish)
-    // same here
-    // vmath_thread_join(g_physics_thread);
-    while (atomic_load(&g_phys_done) == 0) {
-        _mm_pause();
+    // WAIT FOR PHYSICS TO FINISH
+    vmath_mutex_lock(&g_phys_mutex);
+    while (g_phys_done == 0) {
+        vmath_cond_wait(&g_phys_cv_done, &g_phys_mutex);
     }
+    vmath_mutex_unlock(&g_phys_mutex);
 }
+// ========================================================
+// BOOT & SHUTDOWN (The Mutex Initializers)
+// ========================================================
 EXPORT void vmath_init_thread_pool() {
-    // Lua will call this EXACTLY ONCE when the game boots!
+    // 1. Initialize all OS locks & signals
+    vmath_mutex_init(&g_phys_mutex); vmath_cond_init(&g_phys_cv_start); vmath_cond_init(&g_phys_cv_done);
+    vmath_mutex_init(&g_top_mutex);  vmath_cond_init(&g_top_cv_start);  vmath_cond_init(&g_top_cv_done);
+    vmath_mutex_init(&g_bot_mutex);  vmath_cond_init(&g_bot_cv_start);  vmath_cond_init(&g_bot_cv_done);
+
+    // 2. Launch the sleeping threads
     g_physics_thread = vmath_thread_start(vmath_physics_worker, NULL);
     g_raster_top_thread = vmath_thread_start(vmath_raster_worker, (void*)(intptr_t)0);
     g_raster_bot_thread = vmath_thread_start(vmath_raster_worker, (void*)(intptr_t)1);
 }
-EXPORT void vmath_shutdown_thread_pool() {
-    // 1. Send the QUIT signal (2) to all infinite loops
-    atomic_store(&g_phys_sig, 2);
-    atomic_store(&g_top_sig, 2);
-    atomic_store(&g_bot_sig, 2);
 
-    // 2. Wait for the threads to actually exit their functions safely
+EXPORT void vmath_shutdown_thread_pool() {
+    // 1. Send QUIT signal and wake everyone up
+    vmath_mutex_lock(&g_phys_mutex); g_phys_sig = 2; vmath_cond_broadcast(&g_phys_cv_start); vmath_mutex_unlock(&g_phys_mutex);
+    vmath_mutex_lock(&g_top_mutex);  g_top_sig = 2;  vmath_cond_broadcast(&g_top_cv_start);  vmath_mutex_unlock(&g_top_mutex);
+    vmath_mutex_lock(&g_bot_mutex);  g_bot_sig = 2;  vmath_cond_broadcast(&g_bot_cv_start);  vmath_mutex_unlock(&g_bot_mutex);
+
+    // 2. Wait for safe exit
     vmath_thread_join(g_physics_thread);
     vmath_thread_join(g_raster_top_thread);
     vmath_thread_join(g_raster_bot_thread);
+
+    // 3. Clean up OS resources
+    vmath_mutex_destroy(&g_phys_mutex); vmath_cond_destroy(&g_phys_cv_start); vmath_cond_destroy(&g_phys_cv_done);
+    vmath_mutex_destroy(&g_top_mutex);  vmath_cond_destroy(&g_top_cv_start);  vmath_cond_destroy(&g_top_cv_done);
+    vmath_mutex_destroy(&g_bot_mutex);  vmath_cond_destroy(&g_bot_cv_start);  vmath_cond_destroy(&g_bot_cv_done);
 }
