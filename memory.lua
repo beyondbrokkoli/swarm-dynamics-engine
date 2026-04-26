@@ -10,7 +10,7 @@ local Memory = {
 -- ==========================================
 -- [1] THE UNIVERSE BOUNDARIES (Static Limits)
 -- ==========================================
-MAX_OBJS = 20000
+MAX_OBJS = 200000
 MAX_VERTS = 1500000 -- Raised from 500k
 MAX_TRIS = 2500000  -- Raised from 1 Million
 
@@ -30,22 +30,22 @@ local next_box_id = 0
 -- PRO-LEVEL CACHE-ALIGNED MEMORY ALLOCATOR (64-Byte Boundaries)
 -- ========================================================================
 local function AllocateSoA(type_str, count, names)
-    -- 1. Extract the base C type (e.g., "float[?]" -> "float")
-    local base_type = string.gsub(type_str, "%[%?%]", "")
+    -- 1. Extract the base C type (e.g., "float[?]" or "double[1]" -> "float" / "double")
+    -- The pattern "%[.-%]" safely strips brackets and anything inside them!
+    local base_type = string.gsub(type_str, "%[.-%]", "")
     local bytes_needed = ffi.sizeof(base_type) * count
 
     -- 2. Over-allocate by 64 bytes to guarantee room for shifting
-    local alloc_size = bytes_needed + 64
+    local alloc_size = bytes_needed + 64 
 
     for i = 1, #names do
         local name = names[i]
-
+        
         -- 3. Allocate raw bytes
         local raw_bytes = ffi.new("uint8_t[?]", alloc_size)
-
-        -- 4. ANCHOR IT! If we don't save raw_bytes to a Lua table,
-        -- the Garbage Collector will vaporize it, causing a C segfault!
-        Memory.Anchors[name] = raw_bytes
+        
+        -- 4. ANCHOR IT! Prevents the Garbage Collector from vaporizing our memory
+        Memory.Anchors[name] = raw_bytes 
 
         -- 5. Calculate the exact offset needed to hit a 64-byte boundary
         local ptr_num = tonumber(ffi.cast("uintptr_t", raw_bytes))
@@ -57,7 +57,6 @@ local function AllocateSoA(type_str, count, names)
         Memory.Arrays[name] = aligned_ptr
     end
 end
-
 -- ========================================================================
 -- [3] THE SCHEMA (The Pure Data Arrays)
 -- ========================================================================
@@ -79,7 +78,7 @@ AllocateSoA("int[?]", MAX_OBJS, {
 
 -- 3. The Visibility Buffer (Used by the Camera Cull phase to pass to Raster)
 -- Note: Modules will clear and populate this buffer every frame.
-AllocateSoA("double[1]", 1, {"Count_Visible"})
+AllocateSoA("double[?]", 1, {"Count_Visible"})
 AllocateSoA("int[?]", MAX_OBJS, {"Visible_IDs"})
 
 -- 4. Vertex Data (Local, Camera, and Projected Points)
