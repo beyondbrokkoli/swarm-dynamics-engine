@@ -4,7 +4,8 @@
 -- ========================================================================
 local ffi = require("ffi")
 local Memory = {
-    Arrays = {} -- <--- The new safe haven!
+    Arrays = {}, -- <--- The new safe haven!
+    Anchors = {} -- THE LIFESAVER: Prevents Lua GC from deleting our memory!
 }
 -- ==========================================
 -- [1] THE UNIVERSE BOUNDARIES (Static Limits)
@@ -25,14 +26,35 @@ local next_tri_id = 0
 local next_sphere_id = 0
 local next_box_id = 0
 
--- ==========================================
--- [2] THE METAPROGRAMMING ALLOCATOR
--- ==========================================
--- The upgraded Metaprogramming Allocator
-local function AllocateSoA(type_str, size, names)
+-- ========================================================================
+-- PRO-LEVEL CACHE-ALIGNED MEMORY ALLOCATOR (64-Byte Boundaries)
+-- ========================================================================
+local function AllocateSoA(type_str, count, names)
+    -- 1. Extract the base C type (e.g., "float[?]" -> "float")
+    local base_type = string.gsub(type_str, "%[%?%]", "")
+    local bytes_needed = ffi.sizeof(base_type) * count
+
+    -- 2. Over-allocate by 64 bytes to guarantee room for shifting
+    local alloc_size = bytes_needed + 64
+
     for i = 1, #names do
-        -- Inject into our safe table, NOT _G
-        Memory.Arrays[names[i]] = ffi.new(type_str, size)
+        local name = names[i]
+
+        -- 3. Allocate raw bytes
+        local raw_bytes = ffi.new("uint8_t[?]", alloc_size)
+
+        -- 4. ANCHOR IT! If we don't save raw_bytes to a Lua table,
+        -- the Garbage Collector will vaporize it, causing a C segfault!
+        Memory.Anchors[name] = raw_bytes
+
+        -- 5. Calculate the exact offset needed to hit a 64-byte boundary
+        local ptr_num = tonumber(ffi.cast("uintptr_t", raw_bytes))
+        local offset = (64 - (ptr_num % 64)) % 64
+
+        -- 6. Shift the pointer and cast it to the actual type (e.g., float*)
+        local aligned_ptr = ffi.cast(base_type .. "*", raw_bytes + offset)
+
+        Memory.Arrays[name] = aligned_ptr
     end
 end
 
